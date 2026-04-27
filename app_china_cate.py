@@ -4,6 +4,7 @@ Carga los modelos .pkl de CausalForestDML y genera visualizaciones interactivas.
 """
 
 import streamlit as st
+import pickle
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -19,8 +20,6 @@ st.set_page_config(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-BROKER_REF_DEFAULT = "Forever Fresh (Shanghai) Fruit"
-
 # ── Colores ───────────────────────────────────────────────────────────
 COLOR_MEJOR = "#2ecc71"
 COLOR_PEOR = "#e74c3c"
@@ -28,57 +27,180 @@ COLOR_INCIERTO = "#95a5a6"
 
 
 # =====================================================================
-# CARGA DE CATE DESDE CSV
+# CARGA DE MODELOS
+# =====================================================================
+@st.cache_resource(show_spinner="Cargando modelos causales...")
+def load_all_models():
+    models = {}
+    files = {
+        "brokers_semana": "modelos_brokers_semana.pkl",
+        "multiclass": "modelo_multiclass.pkl",
+        "serie": "modelo_multiclass_serie.pkl",
+        "etiqueta": "modelo_multiclass_etiqueta.pkl",
+        "calibre": "modelo_multiclass_calibre.pkl",
+        "codenvase": "modelo_multiclass_codenvase.pkl",
+    }
+    for key, fname in files.items():
+        path = os.path.join(BASE_DIR, fname)
+        if not os.path.exists(path):
+            models[key] = None
+            continue
+        with open(path, "rb") as f:
+            models[key] = pickle.load(f)
+    return models
+
+
+# =====================================================================
+# FUNCIONES DE COMPUTO CATE
 # =====================================================================
 @st.cache_data(show_spinner="Cargando CATE Broker x Semana...")
-def load_cate_brokers_semana():
+def compute_cate_brokers_semana(_models_bs):
+    """
+    Prioriza df_cate_brokers.csv (con filtro N_OBS<10 aplicado en el notebook).
+    Si no existe, recomputa desde los modelos binarios (sin filtro de soporte).
+    """
     csv_path = os.path.join(BASE_DIR, "df_cate_brokers.csv")
-    if not os.path.exists(csv_path):
-        return pd.DataFrame()
-    df = pd.read_csv(csv_path)
-    df["SEMANA"] = df["SEMANA"].astype(int)
-    for col in ("N", "N_TEMP"):
-        if col in df.columns:
-            df[col] = df[col].fillna(0).astype(int)
-    return df
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        df["SEMANA"] = df["SEMANA"].astype(int)
+        for col in ("N", "N_TEMP"):
+            if col in df.columns:
+                df[col] = df[col].fillna(0).astype(int)
+        return df
+
+    modelos = _models_bs["modelos"]
+    rows = []
+    for broker, info in modelos.items():
+        est = info["est"]
+        semanas = np.arange(info["X_min"], info["X_max"] + 1).reshape(-1, 1)
+        cate = est.effect(semanas)
+        lo, hi = est.effect_interval(semanas, alpha=0.05)
+        for i, sem in enumerate(semanas.flatten()):
+            rows.append(
+                {
+                    "BROKER": broker,
+                    "SEMANA": int(sem),
+                    "CATE": float(cate[i]),
+                    "CI_LO": float(lo[i]),
+                    "CI_HI": float(hi[i]),
+                    "N": info["N"],
+                    "N_TEMP": info["N_TEMP"],
+                    "DIRECCION": (
+                        "MEJOR"
+                        if lo[i] > 0
+                        else ("PEOR" if hi[i] < 0 else "INCIERTO")
+                    ),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
-def _load_cate_dim(dimension_col, csv_name):
+def _compute_multiclass_cate(saved, dimension_col, cols_dim):
+    """Generico para multiclass: variedad, serie o etiqueta."""
+    est = saved["est"]
+    brokers_validos = saved["brokers_validos"]
+    BROKER_REF = saved["BROKER_REF"]
+    X_min = saved["X_min"]
+    X_max = saved["X_max"]
+
+    prefix = cols_dim[0].rsplit("_", 1)[0] + "_"
+    dim_values = [c.replace(prefix, "", 1) for c in cols_dim]
+    dim_values_all = ["(Ref.)"] + dim_values
+
+    semanas = np.arange(X_min, X_max + 1)
+    n_cols_X = 1 + len(cols_dim)
+    brokers_alt = [b for b in brokers_validos if b != BROKER_REF]
+
+    rows = []
+    for broker in brokers_alt:
+        for dim_val in dim_values_all:
+            X_query = np.zeros((len(semanas), n_cols_X))
+            X_query[:, 0] = semanas
+
+            if dim_val != "(Ref.)":
+                col_name = prefix + dim_val
+                if col_name in cols_dim:
+                    idx = cols_dim.index(col_name) + 1
+                    X_query[:, idx] = 1
+
+            cate = est.effect(X_query, T0=BROKER_REF, T1=broker)
+            lo, hi = est.effect_interval(
+                X_query, T0=BROKER_REF, T1=broker, alpha=0.05
+            )
+
+            for i, sem in enumerate(semanas):
+                rows.append(
+                    {
+                        "BROKER": broker,
+                        dimension_col: dim_val,
+                        "SEMANA": int(sem),
+                        "CATE": float(cate[i]),
+                        "CI_LO": float(lo[i]),
+                        "CI_HI": float(hi[i]),
+                        "DIRECCION": (
+                            "MEJOR"
+                            if lo[i] > 0
+                            else ("PEOR" if hi[i] < 0 else "INCIERTO")
+                        ),
+                    }
+                )
+    return pd.DataFrame(rows), dim_values_all, brokers_alt, BROKER_REF
+
+
+def _load_or_compute(saved, dimension_col, cols_dim, csv_name):
+    """
+    Prioriza el CSV exportado desde el notebook (con filtro N_OBS<10).
+    Si no existe, cae a recomputar desde el modelo (sin filtro de soporte).
+    """
     csv_path = os.path.join(BASE_DIR, csv_name)
-    if not os.path.exists(csv_path):
-        return pd.DataFrame(), [], []
-    df = pd.read_csv(csv_path)
-    if dimension_col not in df.columns and "VARIEDAD" in df.columns:
-        df = df.rename(columns={"VARIEDAD": dimension_col})
-    df["SEMANA"] = df["SEMANA"].astype(int)
-    dim_values_all = sorted(df[dimension_col].dropna().unique().tolist())
-    brokers_alt = sorted(df["BROKER"].dropna().unique().tolist())
-    return df, dim_values_all, brokers_alt
+    BROKER_REF = saved["BROKER_REF"]
+
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        if dimension_col not in df.columns and "VARIEDAD" in df.columns:
+            df = df.rename(columns={"VARIEDAD": dimension_col})
+        df["SEMANA"] = df["SEMANA"].astype(int)
+        # Valores reales presentes en el CSV (sin "(Ref.)", el notebook no lo emite)
+        dim_values_all = sorted(df[dimension_col].dropna().unique().tolist())
+        brokers_alt = sorted(df["BROKER"].dropna().unique().tolist())
+        return df, dim_values_all, brokers_alt, BROKER_REF
+
+    return _compute_multiclass_cate(saved, dimension_col, cols_dim)
 
 
 @st.cache_data(show_spinner="Cargando CATE Broker x Variedad x Semana...")
-def load_cate_variedad():
-    return _load_cate_dim("VARIEDAD", "df_cate_variedad.csv")
+def compute_cate_variedad(_saved):
+    return _load_or_compute(
+        _saved, "VARIEDAD", _saved["cols_variedad"], "df_cate_variedad.csv"
+    )
 
 
 @st.cache_data(show_spinner="Cargando CATE Broker x Serie x Semana...")
-def load_cate_serie():
-    return _load_cate_dim("SERIE", "df_cate_serie.csv")
+def compute_cate_serie(_saved):
+    return _load_or_compute(
+        _saved, "SERIE", _saved["cols_serie"], "df_cate_serie.csv"
+    )
 
 
 @st.cache_data(show_spinner="Cargando CATE Broker x Etiqueta x Semana...")
-def load_cate_etiqueta():
-    return _load_cate_dim("ETIQUETA", "df_cate_etiqueta.csv")
+def compute_cate_etiqueta(_saved):
+    return _load_or_compute(
+        _saved, "ETIQUETA", _saved["cols_etiqueta"], "df_cate_etiqueta.csv"
+    )
 
 
 @st.cache_data(show_spinner="Cargando CATE Broker x Calibre x Semana...")
-def load_cate_calibre():
-    return _load_cate_dim("CALIBRE", "df_cate_calibre.csv")
+def compute_cate_calibre(_saved):
+    return _load_or_compute(
+        _saved, "CALIBRE", _saved["cols_calibre"], "df_cate_calibre.csv"
+    )
 
 
 @st.cache_data(show_spinner="Cargando CATE Broker x Codenvase x Semana...")
-def load_cate_codenvase():
-    return _load_cate_dim("CODENVASE", "df_cate_codenvase.csv")
+def compute_cate_codenvase(_saved):
+    return _load_or_compute(
+        _saved, "CODENVASE", _saved["cols_codenvase"], "df_cate_codenvase.csv"
+    )
 
 
 # =====================================================================
@@ -311,62 +433,6 @@ def make_bar_chart(df_semana, semana, title_extra=""):
     return fig
 
 
-def make_consolidated_bar_chart(df, group_col, title):
-    """
-    Barras CATE promedio por `group_col` agregando sobre todas las semanas
-    del rango. Usa promedio de CI para dibujar error bars y derivar dirección.
-    """
-    df_agg = (
-        df.dropna(subset=["CATE"])
-        .groupby(group_col)
-        .agg(CATE=("CATE", "mean"), CI_LO=("CI_LO", "mean"), CI_HI=("CI_HI", "mean"))
-        .reset_index()
-        .sort_values("CATE", ascending=True)
-    )
-    if df_agg.empty:
-        fig = go.Figure()
-        fig.add_annotation(text="Sin datos significativos", showarrow=False)
-        return fig
-
-    df_agg["DIRECCION"] = np.where(
-        df_agg["CI_LO"] > 0, "MEJOR",
-        np.where(df_agg["CI_HI"] < 0, "PEOR", "INCIERTO"),
-    )
-    colors = [
-        COLOR_MEJOR if d == "MEJOR" else COLOR_PEOR if d == "PEOR" else COLOR_INCIERTO
-        for d in df_agg["DIRECCION"]
-    ]
-
-    fig = go.Figure(
-        go.Bar(
-            x=df_agg["CATE"],
-            y=df_agg[group_col],
-            orientation="h",
-            marker_color=colors,
-            error_x=dict(
-                type="data",
-                symmetric=False,
-                array=(df_agg["CI_HI"] - df_agg["CATE"]).tolist(),
-                arrayminus=(df_agg["CATE"] - df_agg["CI_LO"]).tolist(),
-                color="rgba(0,0,0,0.3)",
-            ),
-            hovertemplate=(
-                "<b>%{y}</b><br>"
-                "CATE prom: %{x:.3f}<br>"
-                "<extra></extra>"
-            ),
-        )
-    )
-    fig.add_vline(x=0, line_dash="dash", line_color="gray")
-    fig.update_layout(
-        title=title,
-        xaxis_title="CATE promedio (USD/KG vs Forever Fresh)",
-        height=max(400, len(df_agg) * 30 + 100),
-        margin=dict(l=20, r=20, t=50, b=40),
-    )
-    return fig
-
-
 # =====================================================================
 # APP PRINCIPAL
 # =====================================================================
@@ -456,6 +522,9 @@ def main():
         "min_nobs": min_nobs,
     }
 
+    # ── Cargar modelos ────────────────────────────────────────────────
+    models = load_all_models()
+
     # ── Tabs ──────────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         [
@@ -478,7 +547,7 @@ def main():
             "individualmente contra Forever Fresh."
         )
 
-        df_bs = load_cate_brokers_semana()
+        df_bs = compute_cate_brokers_semana(models["brokers_semana"])
 
         # Aplicar filtros globales
         df_bs = filter_by_min_n(df_bs, filtros["min_n"])
@@ -596,14 +665,18 @@ def main():
                 col_chart, col_info = st.columns([3, 1])
                 with col_chart:
                     st.plotly_chart(
-                        make_line_chart(df_det, broker_detalle, BROKER_REF_DEFAULT),
+                        make_line_chart(
+                            df_det,
+                            broker_detalle,
+                            models["brokers_semana"]["BROKER_REF"],
+                        ),
                         use_container_width=True,
                     )
                 with col_info:
-                    if "N" in df_det.columns and not df_det.empty:
-                        st.metric("Registros", f"{int(df_det['N'].iloc[0]):,}")
-                    if "N_TEMP" in df_det.columns and not df_det.empty:
-                        st.metric("Temporadas", int(df_det["N_TEMP"].iloc[0]))
+                    info = models["brokers_semana"]["modelos"].get(broker_detalle)
+                    if info:
+                        st.metric("Registros", f"{info['N']:,}")
+                        st.metric("Temporadas", info["N_TEMP"])
                     n_sig_b = (df_det["DIRECCION"] != "INCIERTO").sum()
                     st.metric("Semanas significativas", f"{n_sig_b}/{len(df_det)}")
                     df_sig = df_det[df_det["DIRECCION"] != "INCIERTO"]
@@ -643,19 +716,19 @@ def main():
             "Heterogeneidad por VARIEDAD COMERCIAL."
         )
 
-        df_var, variedades, brokers_alt_v = load_cate_variedad()
-        if df_var.empty:
-            st.warning("No se encontró df_cate_variedad.csv.")
-        else:
-            _render_multiclass_tab(
-                df_var,
-                dim_col="VARIEDAD",
-                dim_values=variedades,
-                brokers_alt=brokers_alt_v,
-                broker_ref=BROKER_REF_DEFAULT,
-                tab_key="var",
-                filtros=filtros,
-            )
+        df_var, variedades, brokers_alt_v, ref_v = compute_cate_variedad(
+            models["multiclass"]
+        )
+
+        _render_multiclass_tab(
+            df_var,
+            dim_col="VARIEDAD",
+            dim_values=variedades,
+            brokers_alt=brokers_alt_v,
+            broker_ref=ref_v,
+            tab_key="var",
+            filtros=filtros,
+        )
 
     # ==================================================================
     # TAB 3: BROKER x SERIE x SEMANA (multiclass)
@@ -666,19 +739,19 @@ def main():
             "Modelo multiclass: heterogeneidad por SERIE (calibre de la fruta)."
         )
 
-        df_ser, series, brokers_alt_s = load_cate_serie()
-        if df_ser.empty:
-            st.warning("No se encontró df_cate_serie.csv.")
-        else:
-            _render_multiclass_tab(
-                df_ser,
-                dim_col="SERIE",
-                dim_values=series,
-                brokers_alt=brokers_alt_s,
-                broker_ref=BROKER_REF_DEFAULT,
-                tab_key="ser",
-                filtros=filtros,
-            )
+        df_ser, series, brokers_alt_s, ref_s = compute_cate_serie(
+            models["serie"]
+        )
+
+        _render_multiclass_tab(
+            df_ser,
+            dim_col="SERIE",
+            dim_values=series,
+            brokers_alt=brokers_alt_s,
+            broker_ref=ref_s,
+            tab_key="ser",
+            filtros=filtros,
+        )
 
     # ==================================================================
     # TAB 4: BROKER x ETIQUETA x SEMANA (multiclass)
@@ -689,19 +762,19 @@ def main():
             "Modelo multiclass: heterogeneidad por ETIQUETA (marca del producto)."
         )
 
-        df_etq, etiquetas, brokers_alt_e = load_cate_etiqueta()
-        if df_etq.empty:
-            st.warning("No se encontró df_cate_etiqueta.csv.")
-        else:
-            _render_multiclass_tab(
-                df_etq,
-                dim_col="ETIQUETA",
-                dim_values=etiquetas,
-                brokers_alt=brokers_alt_e,
-                broker_ref=BROKER_REF_DEFAULT,
-                tab_key="etq",
-                filtros=filtros,
-            )
+        df_etq, etiquetas, brokers_alt_e, ref_e = compute_cate_etiqueta(
+            models["etiqueta"]
+        )
+
+        _render_multiclass_tab(
+            df_etq,
+            dim_col="ETIQUETA",
+            dim_values=etiquetas,
+            brokers_alt=brokers_alt_e,
+            broker_ref=ref_e,
+            tab_key="etq",
+            filtros=filtros,
+        )
 
     # ==================================================================
     # TAB 5: BROKER x CALIBRE x SEMANA (multiclass)
@@ -712,16 +785,18 @@ def main():
             "Modelo multiclass: heterogeneidad por CALIBRE (tamaño de la fruta)."
         )
 
-        df_cal, calibres, brokers_alt_c = load_cate_calibre()
-        if df_cal.empty:
-            st.warning("No se encontró df_cate_calibre.csv.")
+        if models.get("calibre") is None:
+            st.warning("modelo_multiclass_calibre.pkl no encontrado.")
         else:
+            df_cal, calibres, brokers_alt_c, ref_c = compute_cate_calibre(
+                models["calibre"]
+            )
             _render_multiclass_tab(
                 df_cal,
                 dim_col="CALIBRE",
                 dim_values=calibres,
                 brokers_alt=brokers_alt_c,
-                broker_ref=BROKER_REF_DEFAULT,
+                broker_ref=ref_c,
                 tab_key="cal",
                 filtros=filtros,
             )
@@ -735,16 +810,18 @@ def main():
             "Modelo multiclass: heterogeneidad por CODENVASE (tipo de envase)."
         )
 
-        df_cod, codenvases, brokers_alt_cv = load_cate_codenvase()
-        if df_cod.empty:
-            st.warning("No se encontró df_cate_codenvase.csv.")
+        if models.get("codenvase") is None:
+            st.warning("modelo_multiclass_codenvase.pkl no encontrado.")
         else:
+            df_cod, codenvases, brokers_alt_cv, ref_cv = compute_cate_codenvase(
+                models["codenvase"]
+            )
             _render_multiclass_tab(
                 df_cod,
                 dim_col="CODENVASE",
                 dim_values=codenvases,
                 brokers_alt=brokers_alt_cv,
-                broker_ref=BROKER_REF_DEFAULT,
+                broker_ref=ref_cv,
                 tab_key="cod",
                 filtros=filtros,
             )
@@ -1033,27 +1110,6 @@ def _render_multiclass_tab(
             ),
             use_container_width=True,
         )
-
-        # Consolidado filtrado por un valor específico de la dimensión
-        st.subheader(f"Consolidado por {dim_col} (todas las semanas)")
-        dim_opciones = sorted(df_display[dim_col].dropna().unique().tolist())
-        if dim_opciones:
-            dim_cons = st.selectbox(
-                f"Seleccionar {dim_col} para ver consolidado por broker:",
-                dim_opciones,
-                key=f"{tab_key}_dim_cons",
-            )
-            df_dim_cons = df_display[df_display[dim_col] == dim_cons]
-            st.plotly_chart(
-                make_consolidated_bar_chart(
-                    df_dim_cons,
-                    group_col="BROKER",
-                    title=f"CATE promedio por Broker | {dim_col}: {dim_cons}",
-                ),
-                use_container_width=True,
-            )
-        else:
-            st.info(f"No hay {dim_col}s disponibles con los filtros actuales.")
 
         # Ranking de brokers (solo sobre datos significativos)
         st.subheader("Ranking de Brokers (CATE promedio - solo significativos)")
