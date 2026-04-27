@@ -1,5 +1,5 @@
 # Market-Intelligence — Análisis Causal de Brokers (China)
-
+.
 App de Streamlit que visualiza el efecto causal (CATE) de cada broker
 sobre el retorno (USD/KG) frente al broker de referencia
 **Forever Fresh (Shanghai) Fruit**, usando modelos `CausalForestDML`.
