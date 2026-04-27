@@ -311,6 +311,62 @@ def make_bar_chart(df_semana, semana, title_extra=""):
     return fig
 
 
+def make_consolidated_bar_chart(df, group_col, title):
+    """
+    Barras CATE promedio por `group_col` agregando sobre todas las semanas
+    del rango. Usa promedio de CI para dibujar error bars y derivar dirección.
+    """
+    df_agg = (
+        df.dropna(subset=["CATE"])
+        .groupby(group_col)
+        .agg(CATE=("CATE", "mean"), CI_LO=("CI_LO", "mean"), CI_HI=("CI_HI", "mean"))
+        .reset_index()
+        .sort_values("CATE", ascending=True)
+    )
+    if df_agg.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="Sin datos significativos", showarrow=False)
+        return fig
+
+    df_agg["DIRECCION"] = np.where(
+        df_agg["CI_LO"] > 0, "MEJOR",
+        np.where(df_agg["CI_HI"] < 0, "PEOR", "INCIERTO"),
+    )
+    colors = [
+        COLOR_MEJOR if d == "MEJOR" else COLOR_PEOR if d == "PEOR" else COLOR_INCIERTO
+        for d in df_agg["DIRECCION"]
+    ]
+
+    fig = go.Figure(
+        go.Bar(
+            x=df_agg["CATE"],
+            y=df_agg[group_col],
+            orientation="h",
+            marker_color=colors,
+            error_x=dict(
+                type="data",
+                symmetric=False,
+                array=(df_agg["CI_HI"] - df_agg["CATE"]).tolist(),
+                arrayminus=(df_agg["CATE"] - df_agg["CI_LO"]).tolist(),
+                color="rgba(0,0,0,0.3)",
+            ),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "CATE prom: %{x:.3f}<br>"
+                "<extra></extra>"
+            ),
+        )
+    )
+    fig.add_vline(x=0, line_dash="dash", line_color="gray")
+    fig.update_layout(
+        title=title,
+        xaxis_title="CATE promedio (USD/KG vs Forever Fresh)",
+        height=max(400, len(df_agg) * 30 + 100),
+        margin=dict(l=20, r=20, t=50, b=40),
+    )
+    return fig
+
+
 # =====================================================================
 # APP PRINCIPAL
 # =====================================================================
@@ -977,6 +1033,27 @@ def _render_multiclass_tab(
             ),
             use_container_width=True,
         )
+
+        # Consolidado filtrado por un valor específico de la dimensión
+        st.subheader(f"Consolidado por {dim_col} (todas las semanas)")
+        dim_opciones = sorted(df_display[dim_col].dropna().unique().tolist())
+        if dim_opciones:
+            dim_cons = st.selectbox(
+                f"Seleccionar {dim_col} para ver consolidado por broker:",
+                dim_opciones,
+                key=f"{tab_key}_dim_cons",
+            )
+            df_dim_cons = df_display[df_display[dim_col] == dim_cons]
+            st.plotly_chart(
+                make_consolidated_bar_chart(
+                    df_dim_cons,
+                    group_col="BROKER",
+                    title=f"CATE promedio por Broker | {dim_col}: {dim_cons}",
+                ),
+                use_container_width=True,
+            )
+        else:
+            st.info(f"No hay {dim_col}s disponibles con los filtros actuales.")
 
         # Ranking de brokers (solo sobre datos significativos)
         st.subheader("Ranking de Brokers (CATE promedio - solo significativos)")
